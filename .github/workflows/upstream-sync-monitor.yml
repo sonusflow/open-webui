@@ -1,0 +1,104 @@
+name: Upstream Sync Monitor
+
+on:
+  schedule:
+    # Weekly on Sunday at midnight UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+    inputs:
+      force_report:
+        description: 'Create report even if no changes detected'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for merge-base
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/open-webui/open-webui.git
+          git fetch upstream main --depth=1000
+
+      - name: Run sync analysis
+        id: analysis
+        env:
+          FORCE_REPORT: ${{ github.event.inputs.force_report || 'false' }}
+        run: |
+          python scripts/upstream-sync-analysis.py > report.md
+          echo "has_report=$(test -s report.md && echo 'true' || echo 'false')" >> $GITHUB_OUTPUT
+
+      - name: Close previous sync reports
+        if: steps.analysis.outputs.has_report == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issues = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'upstream-sync',
+              state: 'open'
+            });
+
+            for (const issue of issues.data) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'not_planned'
+              });
+              console.log(`Closed old report #${issue.number}`);
+            }
+
+      - name: Create sync report issue
+        if: steps.analysis.outputs.has_report == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('report.md', 'utf8');
+
+            // Extract summary for title
+            const conflictMatch = report.match(/Potential conflicts[^\d]*(\d+)/);
+            const conflictCount = conflictMatch ? conflictMatch[1] : '0';
+
+            const date = new Date().toISOString().split('T')[0];
+            const title = conflictCount === '0'
+              ? `Upstream Sync Report - ${date} - No conflicts`
+              : `Upstream Sync Report - ${date} - ${conflictCount} potential conflict(s)`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: report,
+              labels: ['upstream-sync']
+            });
+
+            console.log('Created new sync report issue');
+
+      - name: Summary
+        run: |
+          if [ -s report.md ]; then
+            echo "### Upstream Sync Report Generated" >> $GITHUB_STEP_SUMMARY
+            cat report.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### No Changes Detected" >> $GITHUB_STEP_SUMMARY
+            echo "Your fork is up to date with upstream, or no conflicts were found." >> $GITHUB_STEP_SUMMARY
+          fi
